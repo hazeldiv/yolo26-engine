@@ -69,7 +69,7 @@ int graphLoad(yolo_graph* g, const char* modelDir, const char* shaderDir) {
         int64_t bytes = (int64_t)size * 4;
         if (bytes <= 0) bytes = 4;
         void* zero = calloc(1, (size_t)bytes);
-        int memType = (strcmp(name, outName) == 0) ? MEMORY_RAM : MEMORY_VRAM;
+        int memType = (strcmp(name, outName) == 0) ? MEMORY_RAM_CACHED : MEMORY_VRAM;
         g->buffers[i] = createBufferNamed(g->sess.dev.device, g->sess.dev.physicalDevice,
                                           zero, bytes, memType, name);
         free(zero);

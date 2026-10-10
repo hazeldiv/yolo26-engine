@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     const char* dumpTensor = NULL;
     int bench = 0;
     int timing = 0;
+    int meminfo = 0;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--shader") == 0 && i + 1 < argc) shaderDir = argv[++i];
@@ -48,12 +49,16 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dumpPrefix = argv[++i];
         else if (strcmp(argv[i], "--dump-tensor") == 0 && i + 1 < argc) dumpTensor = argv[++i];
         else if (strcmp(argv[i], "--timing") == 0) timing = 1;
+        else if (strcmp(argv[i], "--meminfo") == 0) meminfo = 1;
     }
 
     yolo_graph g;
     if (graphLoad(&g, modelDir, shaderDir) != 0) {
         fprintf(stderr, "graphLoad failed\n");
         return 1;
+    }
+    if (meminfo) {
+        dumpMemoryInfo(g.sess.dev.physicalDevice);
     }
 
     int inElems = 3 * 640 * 640;
@@ -130,6 +135,20 @@ int main(int argc, char** argv) {
         double total = t1 - t0;
         double avg = total / bench;
         printf("bench: %d frames, total %.2f ms, avg %.3f ms, %.1f FPS\n", bench, total, avg, 1000.0 / avg);
+
+        yolo_detection bdets[300];
+        int bn = 0;
+        double t2 = nowMs();
+        for (int i = 0; i < bench; i++) {
+            graphRun(&g, input);
+            graphReadOutput(&g, raw);
+            bn = yoloDecode(raw, g.outChannels, g.outAnchors, g.outBoxes, g.outClasses,
+                            g.outTopk, bdets, 300);
+        }
+        double t3 = nowMs();
+        double full = t3 - t2;
+        printf("bench-full: %d frames, total %.2f ms, avg %.3f ms, %.1f FPS (dets=%d)\n",
+               bench, full, full / bench, 1000.0 / (full / bench), bn);
     }
 
     free(raw);

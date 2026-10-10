@@ -4,6 +4,7 @@
 
 #define MEMORY_RAM 0
 #define MEMORY_VRAM 1
+#define MEMORY_RAM_CACHED 2
 
 typedef struct buffer {
     VkBuffer buffer;

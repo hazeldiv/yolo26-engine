@@ -19,14 +19,30 @@ per frame including input upload, op recording, queue submit and fence wait):
 | **YOLO26s** | 4  | 280 | 19.2 MB | 21.1 ms | **24.4 ms** | **41.0** |
 | **YOLO26m** | 80 | 300 | 41.1 MB | 56.9 ms | **59.6 ms** | **16.8** |
 
-End-to-end through the Python `ctypes` wrapper (includes letterbox + CHW conversion + readback +
-CPU decode), 50 frames:
+### Python `ctypes` wrapper benchmark
 
-| Model | Per-frame | FPS |
-|---|---|---|
-| n | 23.6 ms | 42.5 |
-| s | 42.1 ms | 23.8 |
-| m | 135.7 ms | 7.4 |
+`python/bench.py --warmup 10 --runs 100` on the three root JPGs (1920×1080). `infer_chw` is the pure
+ctypes engine call (memmove + `yolo_infer` + decode); `detect` adds the letterbox + CHW conversion.
+
+| Model | infer_chw | detect (full) | infer FPS | detect FPS |
+|---|---|---|---|---|
+| n | 13.3 ms | 26.4 ms | 75.3 | 37.9 |
+| s | 25.4 ms | 38.2 ms | 39.3 | 26.2 |
+| m | 64.2 ms | 77.7 ms | 15.6 | 12.9 |
+
+`infer_chw` matches the native `test.exe --bench-full` path (within Python-call overhead). The
+`detect` delta is the 1080p→640 letterbox + float CHW conversion (~13 ms).
+
+**The ctypes benchmark exposed a real readback bug.** `test.exe --bench` only times `graphRun`, so
+it never read the output back; the DLL path does. For m the readback added **34 ms/frame** because
+the output buffer was host-visible but *uncached*, so the CPU read it at ~84 MB/s. Fixed by
+allocating the output buffer with `HOST_VISIBLE | HOST_COHERENT | HOST_CACHED` (new
+`MEMORY_RAM_CACHED` type in `buffer.c`; falls back cleanly if unavailable) — m full path
+92.6 → 63.3 ms. The letterbox now uses `cv2.resize` when available (~10× faster than PIL, and the
+same interpolation ultralytics uses).
+
+`test.exe` gained `--meminfo` (dump memory heaps/types) and a `bench-full` line (includes readback +
+CPU decode) so the engine and DLL paths can be compared directly.
 
 ### vs. Python ONNX Runtime (CPU)
 
@@ -213,8 +229,9 @@ Regression after the fixes (random-input tensor compare): class max abs err n 6e
 
 ### Python (`python/yolo26vk`)
 `Detector(model_dir, shader_dir=..., dll_path=...)` → `detect(image)` returns an `[N,6]` array in
-original image coordinates. Letterbox + inverse box scaling in Python; tensor-in / detections-out via
-`ctypes` (GIL released during the call).
+original image coordinates. `infer_chw(chw)` takes an already-letterboxed `[3,640,640]` float array
+and skips the preprocessing. Letterbox + inverse box scaling in Python; tensor-in / detections-out via
+`ctypes` (GIL released during the call). `python/bench.py` benchmarks both entry points.
 
 ## Build & run
 
@@ -222,6 +239,7 @@ original image coordinates. Letterbox + inverse box scaling in Python; tensor-in
 set VULKAN_SDK=D:\VulkanSDK\1.4.350.0
 make                       # builds bin/shader/*.spv, bin/test.exe, bin/yolo26.dll
 bin\test.exe engine_model\s --shader bin\shader --bench 200
+tools\export\.venv\Scripts\python.exe python\bench.py --runs 100
 ```
 
 Regenerate an engine model from an ONNX export:

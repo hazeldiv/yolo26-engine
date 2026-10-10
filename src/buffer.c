@@ -112,8 +112,10 @@ buffer createBufferNamed(VkDevice device, VkPhysicalDevice physicalDevice, void*
     }
     vkGetBufferMemoryRequirements(device, buf.buffer, &buf.memReqs);
 
-    if (memoryType == MEMORY_RAM) {
-        if (allocateBufferMemory(device, physicalDevice, buf.buffer, buf.memReqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &buf.memory, name) != 0) {
+    if (memoryType == MEMORY_RAM || memoryType == MEMORY_RAM_CACHED) {
+        VkMemoryPropertyFlags props = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        if (memoryType == MEMORY_RAM_CACHED) props |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        if (allocateBufferMemory(device, physicalDevice, buf.buffer, buf.memReqs, props, &buf.memory, name) != 0) {
             vkDestroyBuffer(device, buf.buffer, NULL);
             buf.buffer = VK_NULL_HANDLE;
             return buf;
@@ -216,7 +218,7 @@ void destroyBuffer(VkDevice device, buffer buf) {
     }
     VkMemoryRequirements reqs;
     vkGetBufferMemoryRequirements(device, buf.buffer, &reqs);
-    if (buf.memoryType == MEMORY_RAM) g_hostVisibleBytes -= (int64_t)reqs.size;
+    if (buf.memoryType == MEMORY_RAM || buf.memoryType == MEMORY_RAM_CACHED) g_hostVisibleBytes -= (int64_t)reqs.size;
     else g_deviceLocalBytes -= (int64_t)reqs.size;
     vkDestroyBuffer(device, buf.buffer, NULL);
     vkFreeMemory(device, buf.memory, NULL);
