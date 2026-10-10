@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint C; uint Ltotal;
+    uint d0; uint l0; uint s0;
+    uint d1; uint l1; uint s1;
+    uint d2; uint l2; uint s2;
+} p;
+
+layout(set = 0, binding = 0) readonly restrict buffer A0 { float a0[]; };
+layout(set = 0, binding = 1) readonly restrict buffer A1 { float a1[]; };
+layout(set = 0, binding = 2) readonly restrict buffer A2 { float a2[]; };
+layout(set = 0, binding = 3) writeonly restrict buffer Out { float o[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.C * p.Ltotal) return;
+    uint c = i / p.Ltotal;
+    uint j = i - c * p.Ltotal;
+    float v;
+    if (j < p.d1) {
+        v = a0[p.s0 + c * p.l0 + (j - p.d0)];
+    } else if (j < p.d2) {
+        v = a1[p.s1 + c * p.l1 + (j - p.d1)];
+    } else {
+        v = a2[p.s2 + c * p.l2 + (j - p.d2)];
+    }
+    o[c * p.Ltotal + j] = v;
+}

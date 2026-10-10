@@ -1,0 +1,28 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint C; uint H; uint W; uint pad; uint inOff; uint outOff;
+} p;
+
+layout(set = 0, binding = 0) readonly restrict buffer In { float A[]; };
+layout(set = 0, binding = 1) writeonly restrict buffer Out { float O[]; };
+
+void main() {
+    uint Hp = p.H + 2u * p.pad;
+    uint Wp = p.W + 2u * p.pad;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.C * Hp * Wp) return;
+
+    uint c = idx / (Hp * Wp);
+    uint rem = idx % (Hp * Wp);
+    uint py = rem / Wp;
+    uint px = rem % Wp;
+    int iy = int(py) - int(p.pad);
+    int ix = int(px) - int(p.pad);
+    float v = 0.0;
+    if (iy >= 0 && iy < int(p.H) && ix >= 0 && ix < int(p.W))
+        v = A[p.inOff + c * p.H * p.W + uint(iy) * p.W + uint(ix)];
+    O[p.outOff + idx] = v;
+}

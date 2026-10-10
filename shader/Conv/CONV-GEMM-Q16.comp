@@ -5,7 +5,7 @@
 #define TN 32
 #define vec 4
 
-layout(local_size_x = TS, local_size_y = TS, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform P {
     uint M; uint K; uint Npad; uint Cstride;
@@ -25,10 +25,10 @@ void loadTiles(uint t, uint buf, uint tid) {
         uint m = tid / 4;
         uint kv = tid % 4;
         Asub[buf][kv][m] = A[(gl_WorkGroupID.y * TS + m) * (p.Astride / vec) + p.Aoff / vec + t * 4 + kv];
-    }
-    if (tid < 64) {
-        uint block = tid / 32;
-        uint c = tid % 32;
+    } else {
+        uint lt = tid - 64u;
+        uint block = lt / 32u;
+        uint c = lt % 32u;
         uvec4 raw = B[(t * 2 + block) * p.Npad + gl_WorkGroupID.x * TN + c];
         Bsub[buf][block * 2][c]     = vec4(unpackHalf2x16(raw.x), unpackHalf2x16(raw.y));
         Bsub[buf][block * 2 + 1][c] = vec4(unpackHalf2x16(raw.z), unpackHalf2x16(raw.w));
@@ -36,14 +36,16 @@ void loadTiles(uint t, uint buf, uint tid) {
 }
 
 void main() {
-    uint row = gl_LocalInvocationID.y;
-    uint col = gl_LocalInvocationID.x;
-    uint tid = row * TS + col;
-    uint mGlobal = gl_WorkGroupID.y * TS + row;
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint tid = ly * 16u + lx;
+    uint m0 = gl_WorkGroupID.y * TS;
     uint nBase = gl_WorkGroupID.x * TN;
 
-    float acc0 = 0.0;
-    float acc1 = 0.0;
+    float acc00 = 0.0;
+    float acc01 = 0.0;
+    float acc10 = 0.0;
+    float acc11 = 0.0;
 
     uint numTiles = p.K / TS;
     loadTiles(0, 0u, tid);
@@ -53,22 +55,41 @@ void main() {
         if (t + 1 < numTiles) loadTiles(t + 1, cur ^ 1u, tid);
         #pragma unroll
         for (uint kv = 0; kv < 4; kv++) {
-            vec4 a = Asub[cur][kv][row];
-            acc0 += dot(a, Bsub[cur][kv][col * 2]);
-            acc1 += dot(a, Bsub[cur][kv][col * 2 + 1]);
+            vec4 a0 = Asub[cur][kv][ly];
+            vec4 a1 = Asub[cur][kv][ly + 8u];
+            vec4 b0 = Bsub[cur][kv][lx * 2u];
+            vec4 b1 = Bsub[cur][kv][lx * 2u + 1u];
+            acc00 += dot(a0, b0);
+            acc01 += dot(a0, b1);
+            acc10 += dot(a1, b0);
+            acc11 += dot(a1, b1);
         }
         barrier();
     }
 
-    uint n0 = nBase + col * 2;
+    uint mA = m0 + ly;
+    uint mB = m0 + ly + 8u;
+    uint n0 = nBase + lx * 2u;
+    uint crow = p.colOff + n0;
+
     if (n0 < p.Ntrue) {
-        float v0 = acc0 + R[n0];
-        if ((p.flags & 1u) != 0u) v0 = v0 / (1.0 + exp(-v0));
-        C[(p.colOff + n0) * p.Cstride + mGlobal] = v0;
+        float v = acc00 + R[n0];
+        if ((p.flags & 1u) != 0u) v = v / (1.0 + exp(-v));
+        C[crow * p.Cstride + mA] = v;
     }
     if (n0 + 1u < p.Ntrue) {
-        float v1 = acc1 + R[n0 + 1u];
-        if ((p.flags & 1u) != 0u) v1 = v1 / (1.0 + exp(-v1));
-        C[(p.colOff + n0 + 1u) * p.Cstride + mGlobal] = v1;
+        float v = acc01 + R[n0 + 1u];
+        if ((p.flags & 1u) != 0u) v = v / (1.0 + exp(-v));
+        C[(crow + 1u) * p.Cstride + mA] = v;
+    }
+    if (n0 < p.Ntrue) {
+        float v = acc10 + R[n0];
+        if ((p.flags & 1u) != 0u) v = v / (1.0 + exp(-v));
+        C[crow * p.Cstride + mB] = v;
+    }
+    if (n0 + 1u < p.Ntrue) {
+        float v = acc11 + R[n0 + 1u];
+        if ((p.flags & 1u) != 0u) v = v / (1.0 + exp(-v));
+        C[(crow + 1u) * p.Cstride + mB] = v;
     }
 }

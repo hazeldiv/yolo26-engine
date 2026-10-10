@@ -2,7 +2,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform P {
     uint M; uint K; uint Npad; uint Cstride;
@@ -23,19 +23,21 @@ void main() {
     uint tid = ly * 16u + lx;
     uint m0 = gl_WorkGroupID.y * 16u;
     uint n0 = gl_WorkGroupID.x * 32u;
-    uint mGlobal = m0 + ly;
-    uint nBase = n0 + lx * 2u;
 
-    float acc0 = 0.0;
-    float acc1 = 0.0;
+    float acc00 = 0.0;
+    float acc01 = 0.0;
+    float acc10 = 0.0;
+    float acc11 = 0.0;
 
     uint numTiles = (p.K + 15u) / 16u;
     for (uint t = 0; t < numTiles; t++) {
         uint k0 = t * 16u;
-        {
-            uint kk = k0 + ly;
-            As[ly][lx] = (kk < p.K && (m0 + lx) < p.M) ? A[p.Aoff + kk * p.Astride + m0 + lx] : 0.0;
-        }
+        uint i0 = tid;
+        uint i1 = tid + 128u;
+        As[i0 / 16u][i0 % 16u] = (k0 + i0 / 16u < p.K && m0 + i0 % 16u < p.M)
+            ? A[p.Aoff + (k0 + i0 / 16u) * p.Astride + m0 + i0 % 16u] : 0.0;
+        As[i1 / 16u][i1 % 16u] = (k0 + i1 / 16u < p.K && m0 + i1 % 16u < p.M)
+            ? A[p.Aoff + (k0 + i1 / 16u) * p.Astride + m0 + i1 % 16u] : 0.0;
         if (tid < 64u) {
             uint row = tid / 32u;
             uint c = tid % 32u;
@@ -52,22 +54,41 @@ void main() {
         }
         barrier();
         for (uint k = 0u; k < 16u; k++) {
-            float a = As[k][ly];
-            acc0 += a * Bs[k][lx * 2u];
-            acc1 += a * Bs[k][lx * 2u + 1u];
+            float a0 = As[k][ly];
+            float a1 = As[k][ly + 8u];
+            float b0 = Bs[k][lx * 2u];
+            float b1 = Bs[k][lx * 2u + 1u];
+            acc00 += a0 * b0;
+            acc01 += a0 * b1;
+            acc10 += a1 * b0;
+            acc11 += a1 * b1;
         }
         barrier();
     }
 
+    uint mA = m0 + ly;
+    uint mB = m0 + ly + 8u;
+    uint nBase = n0 + lx * 2u;
     uint crow = p.colOff + nBase;
-    if (mGlobal < p.M && nBase < p.Ntrue) {
-        float v0 = acc0 + R[nBase];
-        if ((p.flags & 1u) != 0u) v0 = v0 / (1.0 + exp(-v0));
-        C[crow * p.Cstride + mGlobal] = v0;
+
+    if (mA < p.M && nBase < p.Ntrue) {
+        float v = acc00 + R[nBase];
+        if ((p.flags & 1u) != 0u) v = v / (1.0 + exp(-v));
+        C[crow * p.Cstride + mA] = v;
     }
-    if (mGlobal < p.M && nBase + 1u < p.Ntrue) {
-        float v1 = acc1 + R[nBase + 1u];
-        if ((p.flags & 1u) != 0u) v1 = v1 / (1.0 + exp(-v1));
-        C[(crow + 1u) * p.Cstride + mGlobal] = v1;
+    if (mA < p.M && nBase + 1u < p.Ntrue) {
+        float v = acc01 + R[nBase + 1u];
+        if ((p.flags & 1u) != 0u) v = v / (1.0 + exp(-v));
+        C[(crow + 1u) * p.Cstride + mA] = v;
+    }
+    if (mB < p.M && nBase < p.Ntrue) {
+        float v = acc10 + R[nBase];
+        if ((p.flags & 1u) != 0u) v = v / (1.0 + exp(-v));
+        C[crow * p.Cstride + mB] = v;
+    }
+    if (mB < p.M && nBase + 1u < p.Ntrue) {
+        float v = acc11 + R[nBase + 1u];
+        if ((p.flags & 1u) != 0u) v = v / (1.0 + exp(-v));
+        C[(crow + 1u) * p.Cstride + mB] = v;
     }
 }

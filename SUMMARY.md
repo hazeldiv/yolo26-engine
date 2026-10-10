@@ -15,9 +15,9 @@ per frame including input upload, op recording, queue submit and fence wait):
 
 | Model | Classes | Ops | Weights | GPU time | **Per-frame** | **FPS** |
 |---|---|---|---|---|---|---|
-| **YOLO26n** | 80 | 274 | 5.2 MB | 10.4 ms | **12.4 ms** | **80.6** |
-| **YOLO26s** | 4  | 302 | 19.2 MB | 29.8 ms | **31.4 ms** | **31.9** |
-| **YOLO26m** | 80 | 550 | 41.1 MB | 83.5 ms | **87.4 ms** | **11.4** |
+| **YOLO26n** | 80 | 252 | 5.2 MB | 9.2 ms | **11.3 ms** | **88.8** |
+| **YOLO26s** | 4  | 280 | 19.2 MB | 21.1 ms | **24.4 ms** | **41.0** |
+| **YOLO26m** | 80 | 300 | 41.1 MB | 56.9 ms | **59.6 ms** | **16.8** |
 
 End-to-end through the Python `ctypes` wrapper (includes letterbox + CHW conversion + readback +
 CPU decode), 50 frames:
@@ -35,25 +35,48 @@ Same exported ONNX models, same machine, `tools/export/bench_ort.py` (onnxruntim
 
 | Model | ORT CPU | Vulkan engine | Speedup |
 |---|---|---|---|
-| YOLO26n | 35.1 ms (28.5 FPS) | 12.8 ms (78.3 FPS) | 2.7× |
-| YOLO26s | 102.5 ms (9.8 FPS) | 31.6 ms (31.7 FPS) | 3.2× |
-| YOLO26m | 309.7 ms (3.2 FPS) | 87.9 ms (11.4 FPS) | 3.5× |
+| YOLO26n | 35.1 ms (28.5 FPS) | 11.3 ms (88.8 FPS) | 3.1× |
+| YOLO26s | 102.5 ms (9.8 FPS) | 24.4 ms (41.0 FPS) | 4.2× |
+| YOLO26m | 309.7 ms (3.2 FPS) | 59.6 ms (16.8 FPS) | 5.2× |
 
-GPU time breakdown (`--timing`, op-time only, sum of per-op timestamps):
+GPU time breakdown after optimization (`--timing`, op-time only, sum of per-op timestamps):
 
 | Kernel | n | s | m |
 |---|---|---|---|
-| CONV-GEMM-Q16 (3×3 im2col GEMM) | 4.4 ms | 12.9 ms | 43.1 ms |
-| Im2col | 2.7 ms | 5.2 ms | 15.3 ms |
-| CONV1x1-Q16 (1×1 direct GEMM) | 2.4 ms | 7.8 ms | 20.8 ms |
-| DWConv / MaxPool / Upsample | 0.3 ms | 0.8 ms | 1.0 ms |
-| Attention (FF32 GEMM + Softmax + Transpose) | 0.3 ms | 1.1 ms | 0.5 ms |
-| Elementwise (SiLU-add, concat copies, head decode) | 0.4 ms | 1.9 ms | 2.8 ms |
+| CONV3x3-Q16 (implicit 3×3 GEMM) | 4.6 ms | 10.8 ms | 32.3 ms |
+| CONV1x1-Q16 (1×1 direct GEMM) | 2.2 ms | 7.0 ms | 18.6 ms |
+| Pad | 0.5 ms | 0.8 ms | 2.1 ms |
+| DWConv / MaxPool / Upsample | 0.3 ms | 1.1 ms | 1.0 ms |
+| Attention (FF32 GEMM + Softmax + Transpose) | 0.3 ms | 0.5 ms | 0.5 ms |
+| Elementwise + ConcatA (residuals, concat, head decode) | 0.3 ms | 0.6 ms | 1.9 ms |
+| im2col + CONV-GEMM-Q16 (stem only) | 1.0 ms | 0.3 ms | 0.5 ms |
 
-## Per-shader timing & optimization investigation (YOLO26m)
+## Optimization pass (Tier 2 GPU GEMM + Tier 3 exporter)
+
+Profiling showed the three GEMM kernels at ~1 TFLOP (16% of the RX 580's ~6 TFLOPS) and ~125 GB/s.
+A/B runs used `tools/export/ab_timing.py` (interleaved, 15 rounds, median + min of GPU-timestamp
+totals) because wall-clock drifts ±10% under machine load.
+
+| Phase | Change | Result |
+|---|---|---|
+| 1 | L2 supertile swizzle (tile reorder, B-resident) | **neutral** — reverted |
+| 2 | **128-thread workgroups** (2 waves → 5 WGs/SIMD vs 2) | **3×3 GEMM −35%, 1×1 GEMM −19%, total −21%** |
+| 3 | **Padded implicit 3×3 GEMM** (`Pad` + `CONV3x3-Q16`, kills im2col; stride-1 and stride-2) | **−20%** |
+| 4 | `ConcatA` fused anchor-axis concat (replaces per-channel copies) | neutral GPU, **op count 550→300** |
+| — | 64-thread (1-wave) workgroup variant | indexing bug, not pursued |
+
+The key finding: the GEMM was **latency/occupancy-bound**, not bandwidth-bound. 256-thread
+workgroups are 4 waves, so only 2 fit per GCN4 SIMD (10 wave slots); dropping to 128-thread
+workgroups (2 waves) fits 5 per SIMD, more than doubling in-flight load batches and cutting the
+3×3 GEMM by a third. With that fixed, the im2col pass became the next bottleneck, so it was
+replaced by a one-time zero-pad plus a direct NCHW gather (`CONV3x3-Q16`) — the earlier "neutral"
+implicit-GEMM result was an artifact of the old latency-bound kernel. Net: **m 87.4 → 59.6 ms
+(−32%), 11.4 → 16.8 FPS**.
+
+## Per-shader timing & optimization investigation (YOLO26m) — original baseline
 
 `bin/test.exe engine_model/m --shader bin/shader --timing` dumps a per-op timing log and an aggregate
-summary. Full per-shader breakdown for m (43× 3×3 convs, 61× 1×1 convs, 550 ops total):
+summary. Per-shader breakdown for m *before* optimization (43× 3×3 convs, 61× 1×1 convs, 550 ops):
 
 | Kernel | calls | total | % | avg |
 |---|---|---|---|---|
@@ -156,10 +179,11 @@ Regression after the fixes (random-input tensor compare): class max abs err n 6e
    dead-code-eliminated by the exporter.
 2. `parse_onnx.py`: walks the frozen ONNX graph, fuses `Conv → Sigmoid → Mul` into a SiLU epilogue,
    lowers each node to explicit engine ops, and emits `graph.json` + `weights.bin`.
-   - Conv 3×3 → `Im2col` + `CONV-GEMM-Q16`; Conv 1×1 → `CONV1x1-Q16` (reads NCHW directly as the
-     transposed A-operand); grouped Conv → `DWConv`.
-   - `Split`/`Reshape`/`Slice` are free metadata (buffer views + offsets); `Concat` is materialized
-     by channel-block or per-channel copies (handles both channel-axis and anchor-axis concat).
+   - Conv 3×3 (Cin multiple of 16) → `Pad` + `CONV3x3-Q16` (implicit GEMM reading the padded NCHW
+     input, stride 1 or 2); the Cin=3 stem → `Im2col` + `CONV-GEMM-Q16`; Conv 1×1 → `CONV1x1-Q16`
+     (reads NCHW directly as the transposed A-operand); grouped Conv → `DWConv`.
+   - `Split`/`Reshape`/`Slice` are free metadata (buffer views + offsets); channel-axis `Concat` is a
+     contiguous block copy, anchor-axis `Concat` uses `ConcatA` (up to 3 sources in one dispatch).
    - C2PSA attention is lowered to per-head fp32 matmuls (`CONV-GEMM-FF32`), softmax and 2-D
      transposes — the qkv tensor is read in place via head/part offsets.
    - Head box decode (`Sub`/`Add`/`Mul` by baked anchor-grid constants) + class `Sigmoid` run on GPU;
@@ -179,11 +203,13 @@ Regression after the fixes (random-input tensor compare): class max abs err n 6e
 - `yolo.c` — the C-ABI DLL (`yolo26.dll`): `yolo_open` / `yolo_infer` / `yolo_close` / `yolo_last_error`.
 - `test_main.c` — CLI harness (`--bench`, `--timing`, `--input`, `--dump`, `--dump-tensor`).
 
-### Shaders (`shader/`, GLSL 450, 256-thread workgroups)
-`Im2col`, `CONV-GEMM-Q16` (16×32 fp16-block16 GEMM, channel-major NCHW output, fused bias+SiLU),
-`CONV1x1-Q16` (transposed-A NCHW GEMM), `CONV-GEMM-FF32` (generic fp32 matmul), `DWConv`, `MaxPool`,
-`Upsample2x`, `Elementwise` (add/sub/mul/sigmoid/scale/copy with broadcast periods), `Softmax`,
-`Transpose2D`.
+### Shaders (`shader/`, GLSL 450)
+`Pad` (zero-border NCHW), `CONV3x3-Q16` (implicit 3×3 GEMM reading the padded NCHW input directly,
+128-thread 16×32 tile, fused bias+SiLU), `CONV-GEMM-Q16` (im2col GEMM, used only for the Cin=3 stem),
+`CONV1x1-Q16` (transposed-A NCHW GEMM, 128-thread), `CONV-GEMM-FF32` (generic fp32 matmul), `DWConv`,
+`MaxPool`, `Upsample2x`, `Elementwise` (add/sub/mul/sigmoid/scale/copy with broadcast periods),
+`ConcatA` (fused anchor-axis concat of up to 3 sources), `Softmax`, `Transpose2D`.
+`Im2col` remains for the stem. GEMM workgroups are 128 threads (2 waves) for SIMD occupancy.
 
 ### Python (`python/yolo26vk`)
 `Detector(model_dir, shader_dir=..., dll_path=...)` → `detect(image)` returns an `[N,6]` array in
@@ -216,10 +242,10 @@ boxes = det.detect(pil_or_numpy_image)   # -> np.ndarray [N, 6] x1,y1,x2,y2,scor
 
 - `model/nano.pt` (YOLO26n), `model/small.pt` (custom YOLO26s, 4 classes) and `model/yolo26m.pt`
   (COCO) are the three exported models. `best.pt` (YOLO26l) is present but not exported.
-- FP16 weights with FP32 accumulate: box error ≤ 0.8 px and class error ≤ 0.016 vs the FP32 ONNX
+- FP16 weights with FP32 accumulate: box error ≤ 0.8 px and class error ≤ 1e-5 vs the FP32 ONNX
   reference. `CONV-GEMM-FF32` is available as a per-tensor FP32 escape hatch.
-- The 3×3 path is im2col + GEMM (a working implicit-GEMM variant was measured ~5 % slower on this
-  GPU and is not shipped). The dominant cost is the im2col/GEMM bandwidth; a larger N-tile was also
-  measured slower due to occupancy, so the Pumice-verified 16×32 tile is kept.
+- The 3×3 path is the implicit padded GEMM (`Pad` + `CONV3x3-Q16`); im2col is only used for the
+  Cin=3 stem. The GEMMs run 128-thread workgroups for SIMD occupancy (the dominant lever); a
+  smaller N-tile was measured slower, so the 16×32 tile is kept.
 - No NMS is needed — the YOLO26 one-to-one head is end-to-end.
 - Single queue, serialized ops (global write→read barrier between every op), one `execute()` per frame.
