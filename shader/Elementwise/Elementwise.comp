@@ -28,7 +28,7 @@ void main() {
         uint bi = p.bOff + (p.bPeriod == 0u ? i : i % p.bPeriod);
         r = a * Bb[bi];
     } else if (p.op == 3u) {
-        r = a / (1.0 + exp(-a));
+        r = 1.0 / (1.0 + exp(-a));
     } else if (p.op == 4u) {
         r = a * p.scale;
     } else {

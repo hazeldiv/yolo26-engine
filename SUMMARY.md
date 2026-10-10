@@ -28,6 +28,17 @@ CPU decode), 50 frames:
 | s | 42.1 ms | 23.8 |
 | m | 135.7 ms | 7.4 |
 
+### vs. Python ONNX Runtime (CPU)
+
+Same exported ONNX models, same machine, `tools/export/bench_ort.py` (onnxruntime 1.31.0,
+`CPUExecutionProvider`, default threading — this system has no ROCm/DirectML EP for the RX 580):
+
+| Model | ORT CPU | Vulkan engine | Speedup |
+|---|---|---|---|
+| YOLO26n | 35.1 ms (28.5 FPS) | 12.8 ms (78.3 FPS) | 2.7× |
+| YOLO26s | 102.5 ms (9.8 FPS) | 31.6 ms (31.7 FPS) | 3.2× |
+| YOLO26m | 309.7 ms (3.2 FPS) | 87.9 ms (11.4 FPS) | 3.5× |
+
 GPU time breakdown (`--timing`, op-time only, sum of per-op timestamps):
 
 | Kernel | n | s | m |
@@ -38,6 +49,51 @@ GPU time breakdown (`--timing`, op-time only, sum of per-op timestamps):
 | DWConv / MaxPool / Upsample | 0.3 ms | 0.8 ms | 1.0 ms |
 | Attention (FF32 GEMM + Softmax + Transpose) | 0.3 ms | 1.1 ms | 0.5 ms |
 | Elementwise (SiLU-add, concat copies, head decode) | 0.4 ms | 1.9 ms | 2.8 ms |
+
+## Per-shader timing & optimization investigation (YOLO26m)
+
+`bin/test.exe engine_model/m --shader bin/shader --timing` dumps a per-op timing log and an aggregate
+summary. Full per-shader breakdown for m (43× 3×3 convs, 61× 1×1 convs, 550 ops total):
+
+| Kernel | calls | total | % | avg |
+|---|---|---|---|---|
+| CONV-GEMM-Q16 (3×3, im2col+GEMM) | 43 | 42.5 ms | 51% | 0.99 ms |
+| CONV1x1-Q16 (1×1 direct GEMM) | 61 | 20.8 ms | 25% | 0.34 ms |
+| Im2col | 43 | 13.4 ms | 16% | 0.31 ms |
+| Elementwise | 350 | 2.5 ms | 3% | 0.007 ms |
+| DWConv / FF32 / Upsample / Softmax / MaxPool / Transpose | 76 | 1.5 ms | 2% | — |
+
+The three slowest single ops are all stride-2 downsample convs:
+`Cout=512 M=1600 Cin=512` (7.57 ms), `Cout=256 M=6400 Cin=256` (7.47 ms), `Cout=128 M=25600 Cin=64`
+(3.73 ms). For the 7.47 ms op (3.78 GMAC):
+
+| | A (im2col) | B (weights) |
+|---|---|---|
+| size | 59 MB | 1.2 MB |
+| re-read factor | Npad/32 = 8× | M/16 = 400× |
+| DRAM traffic | 472 MB | 472 MB |
+
+≈950 MB moved in 7.5 ms = **~125 GB/s** (≈half of the RX 580's practical bandwidth) and
+**~1.0 TFLOP** (≈16% of peak). The GEMMs are **bandwidth/latency-bound on tile re-reads**, not
+compute-bound; im2col is a pure 13 ms pass that writes 59 MB only to read it back.
+
+Eight shader-level optimizations were implemented, validated against ONNX Runtime, and benchmarked.
+**None beat the Pumice-derived baseline** (each was neutral or worse, measured by both wall-clock and
+GPU timestamp totals):
+
+| Attempt | Change | Result |
+|---|---|---|
+| Tap-decomposed 3×3 GEMM | read NCHW directly, no im2col (stride-1) | neutral (removed im2col but slower A gather) |
+| Register-blocked 32×32 tile | 2×2 outputs/thread (im2col and tap variants) | worse (register/occupancy pressure) |
+| Triple-buffered K-loop | 2-deep prefetch, 1 barrier/tile | neutral |
+| KT=32 K-tile | half the barriers, 8 vec4 per tile | worse |
+| Vectorized 1×1 A-load | vec4 along m | worse |
+| fp16 im2col | halve A traffic | worse **and** less accurate |
+| Concat direct-write | producers write straight into the concat buffer | worse (scattered early writes hurt locality) |
+
+Conclusion: the tiling is already at the practical limit for this GPU; the remaining gap to peak is
+the RX 580's memory subsystem at these activation-heavy shapes (large M, small N), not shader
+inefficiency. The shipped kernels are the validated baseline.
 
 ## Correctness
 
@@ -52,6 +108,45 @@ tensor `[1, 8, 8400]` (4 box channels + classes) at FP16 tolerance:
 
 The pipeline is also checked layer-by-layer against ONNX Runtime intermediate activations (stem
 SiLU, C3k2 concat, SPPF, C2PSA attention output, head box/class logits) — all within FP16 rounding.
+
+### Real-image validation (CPU ground truth vs GPU engine)
+
+`tools/export/validate_images.py` runs the 3 root images (`000041.jpg`, `000068.jpg`, `000077.jpg`)
+through every variant and compares the **GPU engine** (`Detector.detect`, full stack: letterbox →
+engine → decode → inverse scaling) against two CPU references. Detections are matched greedily by
+class at IoU ≥ 0.5; errors are in original-image pixels. `conf ≥ 0.25`:
+
+| Variant | Image | ONNX-CPU vs engine (match/tot, box err max/mean, score err) | PT-CPU vs engine |
+|---|---|---|---|
+| n | 000041 | 13/13, 0.03 / 0.01 px, 0.0018 | 13/13, 14.8 / 7.1 px |
+| n | 000068 | 25/25, 0.06 / 0.02 px, 0.0132 | 23/27, 25.3 / 7.4 px |
+| n | 000077 | 27/27, 0.06 / 0.02 px, 0.0068 | 22/26, 49.4 / 7.1 px |
+| s | 000041 | 13/13, 0.04 / 0.02 px, 0.0002 | 13/13, 18.1 / 5.5 px |
+| s | 000068 | 24/24, 0.06 / 0.02 px, 0.0016 | 24/26, 10.3 / 5.0 px |
+| s | 000077 | 24/24, 0.08 / 0.02 px, 0.0364 | 24/25, 45.4 / 8.9 px |
+| m | 000041 | 0/0 (no COCO object ≥ 0.25) | 0/0 |
+| m | 000068 | 2/2, 0.02 / 0.01 px, 0.0038 | 2/4, 6.1 / 3.6 px |
+| m | 000077 | 4/4, 0.04 / 0.02 px, 0.0037 | 3/4, 43.4 / 15.3 px |
+
+The engine matches the exported ONNX graph on CPU **exactly** (100% of confident detections,
+sub-0.1 px box error, ≤0.04 score error). The larger spread against the ultralytics `.pt` path is
+ultralytics' own predict pipeline (its own letterbox/resize interpolation and box scaling), not the
+engine — the engine reproduces the exported graph bit-for-bit within FP16.
+
+**Two real bugs were found by this test** (both invisible to the random-input tensor compare, which
+passed on noise because those logits are ~0):
+
+1. **Head Sigmoid used the SiLU formula.** `Elementwise.comp` op `3` computed `a/(1+exp(-a))`
+   (SiLU) instead of the sigmoid `1/(1+exp(-a))`. On random-noise input the class logits are very
+   negative so both formulas evaluate to ~0 and the compare passed; on real images with positive
+   logits the engine emitted raw logits instead of probabilities (class error 0.016 → 0.000006
+   after the fix).
+2. **Python wrapper fed HWC data to a CHW engine.** `canvas.transpose(2,0,1)/255` returns an
+   *F-contiguous* array (still HWC memory order), so `ctypes.memmove` copied the wrong layout.
+   Fixed with `np.ascontiguousarray(...)`.
+
+Regression after the fixes (random-input tensor compare): class max abs err n 6e-6 / s 6e-6 / m 3e-6.
+
 
 ## Architecture
 

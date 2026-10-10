@@ -59,14 +59,15 @@ void main() {
         barrier();
     }
 
-    if (nBase < p.Ntrue) {
+    uint crow = p.colOff + nBase;
+    if (mGlobal < p.M && nBase < p.Ntrue) {
         float v0 = acc0 + R[nBase];
         if ((p.flags & 1u) != 0u) v0 = v0 / (1.0 + exp(-v0));
-        C[(p.colOff + nBase) * p.Cstride + mGlobal] = v0;
+        C[crow * p.Cstride + mGlobal] = v0;
     }
-    if (nBase + 1u < p.Ntrue) {
+    if (mGlobal < p.M && nBase + 1u < p.Ntrue) {
         float v1 = acc1 + R[nBase + 1u];
         if ((p.flags & 1u) != 0u) v1 = v1 / (1.0 + exp(-v1));
-        C[(p.colOff + nBase + 1u) * p.Cstride + mGlobal] = v1;
+        C[(crow + 1u) * p.Cstride + mGlobal] = v1;
     }
 }

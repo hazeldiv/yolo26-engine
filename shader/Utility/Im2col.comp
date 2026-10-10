@@ -22,7 +22,6 @@ void main() {
     uint k0 = kv * 4u;
     uint kLimit = p.Cin * 9u;
 
-    float vals[4];
     for (uint j = 0u; j < 4u; j++) {
         uint k = k0 + j;
         float v = 0.0;
@@ -34,12 +33,6 @@ void main() {
             if (iy >= 0 && iy < int(p.inH) && ix >= 0 && ix < int(p.inW))
                 v = A[p.Aoff + c * p.inH * p.inW + uint(iy) * p.inW + uint(ix)];
         }
-        vals[j] = v;
+        O[m * p.Kpad + k] = v;
     }
-
-    uint base = m * p.Kpad + k0;
-    O[base + 0u] = vals[0];
-    O[base + 1u] = vals[1];
-    O[base + 2u] = vals[2];
-    O[base + 3u] = vals[3];
 }
