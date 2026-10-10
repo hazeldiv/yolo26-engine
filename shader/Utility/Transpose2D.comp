@@ -1,0 +1,25 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint rows; uint cols; uint inOff; uint outOff;
+} p;
+
+layout(set = 0, binding = 0) readonly restrict buffer In { float A[]; };
+layout(set = 0, binding = 1) writeonly restrict buffer Out { float O[]; };
+
+shared float tile[16][17];
+
+void main() {
+    uint ix = gl_GlobalInvocationID.x;
+    uint iy = gl_GlobalInvocationID.y;
+    if (ix < p.cols && iy < p.rows)
+        tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = A[p.inOff + iy * p.cols + ix];
+    barrier();
+
+    uint oy = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint ox = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    if (oy < p.cols && ox < p.rows)
+        O[p.outOff + oy * p.rows + ox] = tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x];
+}

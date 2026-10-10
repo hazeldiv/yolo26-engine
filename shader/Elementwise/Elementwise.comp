@@ -1,0 +1,38 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint count; uint aOff; uint bOff; uint cOff;
+    uint op; uint bPeriod; uint aPeriod; float scale;
+} p;
+
+layout(set = 0, binding = 0) readonly restrict buffer A { float Ab[]; };
+layout(set = 0, binding = 1) readonly restrict buffer B { float Bb[]; };
+layout(set = 0, binding = 2) writeonly restrict buffer C { float Cb[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.count) return;
+
+    uint ai = p.aOff + (p.aPeriod == 0u ? i : i % p.aPeriod);
+    float a = Ab[ai];
+    float r;
+    if (p.op == 0u) {
+        uint bi = p.bOff + (p.bPeriod == 0u ? i : i % p.bPeriod);
+        r = a + Bb[bi];
+    } else if (p.op == 1u) {
+        uint bi = p.bOff + (p.bPeriod == 0u ? i : i % p.bPeriod);
+        r = a - Bb[bi];
+    } else if (p.op == 2u) {
+        uint bi = p.bOff + (p.bPeriod == 0u ? i : i % p.bPeriod);
+        r = a * Bb[bi];
+    } else if (p.op == 3u) {
+        r = a / (1.0 + exp(-a));
+    } else if (p.op == 4u) {
+        r = a * p.scale;
+    } else {
+        r = a;
+    }
+    Cb[p.cOff + i] = r;
+}

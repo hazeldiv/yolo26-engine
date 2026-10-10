@@ -1,0 +1,36 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint C; uint H; uint W; uint k;
+    uint stride; uint pad; uint inOff; uint outOff;
+} p;
+
+layout(set = 0, binding = 0) readonly restrict buffer In { float A[]; };
+layout(set = 0, binding = 1) writeonly restrict buffer Out { float O[]; };
+
+void main() {
+    uint outW = (p.W + 2u * p.pad - p.k) / p.stride + 1u;
+    uint outH = (p.H + 2u * p.pad - p.k) / p.stride + 1u;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.C * outH * outW) return;
+
+    uint ox = idx % outW;
+    uint tmp = idx / outW;
+    uint oy = tmp % outH;
+    uint c = tmp / outH;
+
+    float best = -1e30;
+    for (uint ky = 0u; ky < p.k; ky++) {
+        for (uint kx = 0u; kx < p.k; kx++) {
+            int iy = int(oy * p.stride) - int(p.pad) + int(ky);
+            int ix = int(ox * p.stride) - int(p.pad) + int(kx);
+            if (iy >= 0 && iy < int(p.H) && ix >= 0 && ix < int(p.W)) {
+                float v = A[p.inOff + c * p.H * p.W + uint(iy) * p.W + uint(ix)];
+                if (v > best) best = v;
+            }
+        }
+    }
+    O[p.outOff + c * outH * outW + oy * outW + ox] = best;
+}

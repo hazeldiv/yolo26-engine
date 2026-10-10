@@ -1,0 +1,45 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint inW; uint inH; uint Cin; uint Aoff;
+    uint Kpad; uint stride; uint pad; uint outW; uint outH;
+} p;
+
+layout(set = 0, binding = 0) readonly restrict buffer In { float A[]; };
+layout(set = 0, binding = 1) writeonly restrict buffer Out { float O[]; };
+
+void main() {
+    uint vecPerRow = p.Kpad / 4u;
+    uint idx = gl_GlobalInvocationID.x;
+    uint m = idx / vecPerRow;
+    uint kv = idx % vecPerRow;
+    if (m >= p.outH * p.outW) return;
+
+    uint oy = m / p.outW;
+    uint ox = m % p.outW;
+    uint k0 = kv * 4u;
+    uint kLimit = p.Cin * 9u;
+
+    float vals[4];
+    for (uint j = 0u; j < 4u; j++) {
+        uint k = k0 + j;
+        float v = 0.0;
+        if (k < kLimit) {
+            uint tap = k / p.Cin;
+            uint c = k - tap * p.Cin;
+            int iy = int(oy * p.stride) - int(p.pad) + int(tap / 3u);
+            int ix = int(ox * p.stride) - int(p.pad) + int(tap % 3u);
+            if (iy >= 0 && iy < int(p.inH) && ix >= 0 && ix < int(p.inW))
+                v = A[p.Aoff + c * p.inH * p.inW + uint(iy) * p.inW + uint(ix)];
+        }
+        vals[j] = v;
+    }
+
+    uint base = m * p.Kpad + k0;
+    O[base + 0u] = vals[0];
+    O[base + 1u] = vals[1];
+    O[base + 2u] = vals[2];
+    O[base + 3u] = vals[3];
+}

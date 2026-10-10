@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint M; uint N; uint K; uint Astride; uint Bstride; uint Cstride;
+    uint Ntrue; uint colOff; uint Aoff; uint Boff; uint flags;
+} p;
+
+layout(set = 0, binding = 0) readonly restrict buffer MatrixA { float A[]; };
+layout(set = 0, binding = 1) readonly restrict buffer MatrixB { float B[]; };
+layout(set = 0, binding = 2) writeonly restrict buffer MatrixC { float C[]; };
+layout(set = 0, binding = 3) readonly restrict buffer MatrixR { float R[]; };
+
+shared float As[16][17];
+shared float Bs[16][17];
+
+void main() {
+    uint row = gl_LocalInvocationID.y;
+    uint col = gl_LocalInvocationID.x;
+    uint mGlobal = gl_WorkGroupID.y * 16u + row;
+    uint nGlobal = gl_WorkGroupID.x * 16u + col;
+
+    float acc = 0.0;
+    uint numTiles = (p.K + 15u) / 16u;
+    for (uint t = 0; t < numTiles; t++) {
+        uint k0 = t * 16u;
+        if (mGlobal < p.M && k0 + col < p.K)
+            As[row][col] = A[p.Aoff + mGlobal * p.Astride + k0 + col];
+        else
+            As[row][col] = 0.0;
+        if (k0 + row < p.K && nGlobal < p.N)
+            Bs[row][col] = B[p.Boff + (k0 + row) * p.Bstride + nGlobal];
+        else
+            Bs[row][col] = 0.0;
+        barrier();
+        for (uint k = 0u; k < 16u; k++) acc += As[row][k] * Bs[k][col];
+        barrier();
+    }
+
+    if (mGlobal < p.M && nGlobal < p.Ntrue) {
+        float v = acc + R[nGlobal];
+        if ((p.flags & 1u) != 0u) v = v / (1.0 + exp(-v));
+        C[mGlobal * p.Cstride + p.colOff + nGlobal] = v;
+    }
+}
