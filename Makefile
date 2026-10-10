@@ -13,7 +13,7 @@ SHADER_DIR   := shader
 
 CORE_SRCS    := $(SRC_DIR)/buffer.c $(SRC_DIR)/device.c $(SRC_DIR)/descriptor.c \
                 $(SRC_DIR)/dispatch.c $(SRC_DIR)/fence.c $(SRC_DIR)/pipeline.c \
-                $(SRC_DIR)/session.c $(SRC_DIR)/json.c
+                $(SRC_DIR)/session.c $(SRC_DIR)/onnx.c $(SRC_DIR)/compile.c
 ENGINE_SRCS  := $(CORE_SRCS) $(SRC_DIR)/graph.c $(SRC_DIR)/decode.c
 CORE_OBJS    := $(ENGINE_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 TEST_OBJS    := $(BUILD_DIR)/test_main.o $(BUILD_DIR)/yolo.o $(CORE_OBJS)

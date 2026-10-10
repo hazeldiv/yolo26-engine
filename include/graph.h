@@ -2,7 +2,6 @@
 #define graph_h
 
 #include "dispatch.h"
-#include "json.h"
 
 typedef struct yolo_graph {
     session sess;
@@ -29,7 +28,7 @@ typedef struct yolo_graph {
     int onnxCount;
 } yolo_graph;
 
-int graphLoad(yolo_graph* g, const char* modelDir, const char* shaderDir);
+int graphLoad(yolo_graph* g, const char* onnxPath, const char* shaderDir);
 void graphFree(yolo_graph* g);
 void graphRun(yolo_graph* g, const float* input);
 void graphRunLogged(yolo_graph* g, const float* input, const char* phase, int token);

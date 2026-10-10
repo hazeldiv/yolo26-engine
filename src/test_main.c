@@ -1,5 +1,6 @@
 #include "yolo.h"
 #include "graph.h"
+#include "compile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,9 +29,43 @@ static void writeFloats(const char* path, const float* p, int n) {
     fclose(f);
 }
 
+static void dumpPlan(const char* onnxPath, const char* outFile) {
+    graph_plan plan;
+    if (compileOnnx(onnxPath, &plan) != 0) {
+        fprintf(stderr, "compile failed: %s\n", compileLastError());
+        exit(1);
+    }
+    FILE* f = fopen(outFile, "w");
+    for (int i = 0; i < plan.resCount; i++) {
+        if (!plan.res[i].isWeight) fprintf(f, "BUF %s %lld\n", plan.res[i].name, (long long)plan.res[i].size);
+    }
+    for (int i = 0; i < plan.resCount; i++) {
+        if (plan.res[i].isWeight) fprintf(f, "WGT %s %lld\n", plan.res[i].name, (long long)plan.res[i].nbytes);
+    }
+    for (int i = 0; i < plan.opCount; i++) {
+        graph_op* o = &plan.ops[i];
+        fprintf(f, "OP %s", o->shader);
+        for (int b = 0; b < o->bufferCount; b++) fprintf(f, " %s", plan.res[o->buffers[b]].name);
+        fprintf(f, " |");
+        for (int p = 0; p < o->pushConstantCount; p++) fprintf(f, " %d", o->pushConstants[p]);
+        fprintf(f, " | %d %d %d\n", o->dispatchX, o->dispatchY, o->dispatchZ);
+    }
+    fprintf(f, "OUT %s %d %d %d %d %d\n", plan.res[plan.outputRes].name, plan.outChannels,
+            plan.outAnchors, plan.outBoxes, plan.outClasses, plan.outTopk);
+    fclose(f);
+    char wbin[600];
+    snprintf(wbin, sizeof(wbin), "%s.wbin", outFile);
+    FILE* wf = fopen(wbin, "wb");
+    if (wf != NULL) {
+        fwrite(plan.wblob, 1, (size_t)plan.wblobLen, wf);
+        fclose(wf);
+    }
+    freePlan(&plan);
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: test.exe <model_dir> [--shader <dir>] [--bench N] [--input <raw>] [--dump <prefix>]\n");
+        fprintf(stderr, "usage: test.exe <model.onnx> [--shader <dir>] [--bench N] [--input <raw>] [--dump <prefix>]\n");
         return 1;
     }
     const char* modelDir = argv[1];
@@ -38,6 +73,7 @@ int main(int argc, char** argv) {
     const char* inputFile = NULL;
     const char* dumpPrefix = NULL;
     const char* dumpTensor = NULL;
+    const char* dumpPlanFile = NULL;
     int bench = 0;
     int timing = 0;
     int meminfo = 0;
@@ -48,8 +84,14 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) inputFile = argv[++i];
         else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dumpPrefix = argv[++i];
         else if (strcmp(argv[i], "--dump-tensor") == 0 && i + 1 < argc) dumpTensor = argv[++i];
+        else if (strcmp(argv[i], "--dump-plan") == 0 && i + 1 < argc) dumpPlanFile = argv[++i];
         else if (strcmp(argv[i], "--timing") == 0) timing = 1;
         else if (strcmp(argv[i], "--meminfo") == 0) meminfo = 1;
+    }
+
+    if (dumpPlanFile != NULL) {
+        dumpPlan(modelDir, dumpPlanFile);
+        return 0;
     }
 
     yolo_graph g;

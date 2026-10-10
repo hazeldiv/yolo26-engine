@@ -12,14 +12,14 @@ struct yolo_model {
 
 static char g_lastError[512] = "";
 
-int yolo_open(const char* model_dir, const char* shader_dir, yolo_model** out) {
+int yolo_open(const char* onnx_path, const char* shader_dir, yolo_model** out) {
     yolo_model* m = (yolo_model*)calloc(1, sizeof(yolo_model));
     if (m == NULL) {
         snprintf(g_lastError, sizeof(g_lastError), "out of memory");
         return -1;
     }
-    if (graphLoad(&m->g, model_dir, shader_dir) != 0) {
-        snprintf(g_lastError, sizeof(g_lastError), "failed to load model from %s", model_dir);
+    if (graphLoad(&m->g, onnx_path, shader_dir) != 0) {
+        snprintf(g_lastError, sizeof(g_lastError), "failed to load model from %s", onnx_path);
         free(m);
         return -1;
     }

@@ -5,8 +5,10 @@ built on the proven Pumice LLM engine core (verbatim Vulkan buffer/device/descri
 session/dispatch layer, `operation` dispatch API, fp16 block-16 weight layout, RX 580 wave64
 16×16/256-thread GEMM tiling). FP16 weights with FP32 accumulation; fixed 640×640 input.
 
-The engine reads every tensor dimension at runtime from the exported graph, so the **same binary**
-runs n, s and m without recompilation.
+The engine reads the model **directly from the `.onnx` file** at load time — it parses the ONNX
+protobuf, runs its own static shape inference, lowers the graph to engine ops and repacks the weights
+in memory. There is no `graph.json` / `weights.bin` export step. The **same binary** runs n, s and m
+without recompilation.
 
 ## Performance (RX 580 8 GB, 640×640, batch 1)
 
@@ -91,7 +93,7 @@ implicit-GEMM result was an artifact of the old latency-bound kernel. Net: **m 8
 
 ## Per-shader timing & optimization investigation (YOLO26m) — original baseline
 
-`bin/test.exe engine_model/m --shader bin/shader --timing` dumps a per-op timing log and an aggregate
+`bin/test.exe model/yolo26m.onnx --shader bin/shader --timing` dumps a per-op timing log and an aggregate
 summary. Per-shader breakdown for m *before* optimization (43× 3×3 convs, 61× 1×1 convs, 550 ops):
 
 | Kernel | calls | total | % | avg |
@@ -189,35 +191,55 @@ Regression after the fixes (random-input tensor compare): class max abs err n 6e
 
 ## Architecture
 
-### Export pipeline (`tools/export/`, uv venv, one-time build dependency)
-1. `export_yolo26.py`-style export: `.pt` → ONNX (`imgsz=640, nms=False, dynamic=False, opset=14,
-   simplify=True`). Ultralytics emits the end-to-end one-to-one head; the one-to-many branch is
-   dead-code-eliminated by the exporter.
-2. `parse_onnx.py`: walks the frozen ONNX graph, fuses `Conv → Sigmoid → Mul` into a SiLU epilogue,
-   lowers each node to explicit engine ops, and emits `graph.json` + `weights.bin`.
-   - Conv 3×3 (Cin multiple of 16) → `Pad` + `CONV3x3-Q16` (implicit GEMM reading the padded NCHW
-     input, stride 1 or 2); the Cin=3 stem → `Im2col` + `CONV-GEMM-Q16`; Conv 1×1 → `CONV1x1-Q16`
-     (reads NCHW directly as the transposed A-operand); grouped Conv → `DWConv`.
-   - `Split`/`Reshape`/`Slice` are free metadata (buffer views + offsets); channel-axis `Concat` is a
-     contiguous block copy, anchor-axis `Concat` uses `ConcatA` (up to 3 sources in one dispatch).
-   - C2PSA attention is lowered to per-head fp32 matmuls (`CONV-GEMM-FF32`), softmax and 2-D
-     transposes — the qkv tensor is read in place via head/part offsets.
-   - Head box decode (`Sub`/`Add`/`Mul` by baked anchor-grid constants) + class `Sigmoid` run on GPU;
-     the engine's single readback tensor is the `[1, C+4, 8400]` pre-top-k prediction.
-   - `weights.bin`: fp16 block-16 (K-major) GEMM weights, raw fp16 depthwise weights, fp32 biases and
-     head constants. K padded to `ceil16`, N padded to `ceil32`.
+### ONNX front-end (`src/onnx.c`, `src/compile.c`)
+The engine consumes the `.onnx` file directly; there is no offline export step.
+1. `onnx.c` — a minimal protobuf reader (varint + length-delimited fields). It walks
+   `ModelProto → graph → node/initializer/input` and extracts nodes (op type, inputs, outputs,
+   attributes), initializers (float32 / int64 tensors) and the input shape. Nodes and attributes are
+   the only protobuf messages parsed; the 800-entry `value_info` table is ignored.
+2. `compile.c` — a C port of the previous Python lowering, run at load time:
+   - **Static shape inference** for every op present (Conv, MaxPool, Resize, Concat, Split, Reshape,
+     Transpose, MatMul, Softmax, Slice, Unsqueeze, Expand, GatherElements, Flatten, TopK, ReduceMax,
+     elementwise, …). The 640×640 input makes all shapes static.
+   - **Lowering**: `Conv → Sigmoid → Mul` is fused into a SiLU epilogue; Conv 3×3 (Cin multiple of 16)
+     → `Pad` + `CONV3x3-Q16` (implicit GEMM reading the padded NCHW input, stride 1 or 2); the Cin=3
+     stem → `Im2col` + `CONV-GEMM-Q16`; Conv 1×1 → `CONV1x1-Q16` (reads NCHW directly as the
+     transposed A-operand); grouped Conv → `DWConv`. `Split`/`Reshape`/`Slice` are free metadata
+     (buffer views + offsets); channel-axis `Concat` is a contiguous block copy, anchor-axis `Concat`
+     uses `ConcatA` (up to 3 sources in one dispatch). C2PSA attention is lowered to per-head fp32
+     matmuls (`CONV-GEMM-FF32`), softmax and 2-D transposes — the qkv tensor is read in place via
+     head/part offsets. Head box decode (`Sub`/`Add`/`Mul` by baked anchor-grid constants) + class
+     `Sigmoid` run on GPU; the engine's single readback tensor is the `[1, C+4, 8400]` pre-top-k
+     prediction.
+   - **Weight repacking in C**: fp16 block-16 (K-major) GEMM weights, raw fp16 depthwise weights, fp32
+     biases and head constants. K padded to `ceil16`, N padded to `ceil32`. The fp32→fp16 conversion
+     is round-to-nearest-even, bit-identical to numpy's `astype(np.float16)`.
+   - The transformed weight bytes and the lowered op list are produced in memory and consumed directly
+     by `graph.c` (no file is written).
 3. `dump_reference.py` / `validate.py`: ONNX Runtime reference extraction + comparison.
 4. `inspect_onnx.py`: graph/node/attribute dump used while reverse-engineering the head.
 
+The C front-end is verified to produce **exactly** the same op list, buffer layout and weight bytes as
+the previous Python exporter: for all three models the compiled plan (op shaders, bindings, push
+constants, dispatches, buffer sizes, weight sizes) is identical, and the repacked weight blob is
+byte-for-byte identical (MD5) to the old `weights.bin`. `test.exe --dump-plan <file>` emits the plan
+for this comparison.
+
 ### Engine core (`src/`, `include/`)
-- `buffer/device/descriptor/pipeline/session/fence/dispatch/json.c` — verbatim from Pumice.
-- `graph.c` — parses `graph.json`, allocates one VRAM buffer per activation and per weight, builds
-  `operation[]` (shader, bindings, push constants, dispatch), uploads the input, runs `execute()`.
-  The output tensor is host-visible for zero-submit readback.
+- `buffer/device/descriptor/pipeline/session/fence/dispatch.c` — verbatim from Pumice.
+- `onnx.c` — ONNX protobuf reader (see above).
+- `compile.c` — static shape inference, graph lowering and in-memory weight repacking (see above).
+- `graph.c` — turns the compiled plan into Vulkan resources: one VRAM buffer per activation and per
+  weight, `operation[]` (shader, bindings, push constants, dispatch), input upload, `execute()`.
+  The output tensor is host-visible/host-cached for zero-submit readback.
 - `decode.c` — CPU two-stage top-300 (per-anchor max → top anchors → top anchor/class pairs) matching
   the in-graph ONNX TopK, producing `[x1,y1,x2,y2,score,cls]`.
 - `yolo.c` — the C-ABI DLL (`yolo26.dll`): `yolo_open` / `yolo_infer` / `yolo_close` / `yolo_last_error`.
-- `test_main.c` — CLI harness (`--bench`, `--timing`, `--input`, `--dump`, `--dump-tensor`).
+- `test_main.c` — CLI harness (`--bench`, `--timing`, `--input`, `--dump`, `--dump-tensor`,
+  `--dump-plan`, `--meminfo`).
+
+Load time (ONNX parse + shape inference + lowering + weight repack + upload) is a one-time cost:
+n ≈ 0.7 s, s ≈ 0.95 s, m ≈ 1.6 s.
 
 ### Shaders (`shader/`, GLSL 450)
 `Pad` (zero-border NCHW), `CONV3x3-Q16` (implicit 3×3 GEMM reading the padded NCHW input directly,
@@ -228,7 +250,7 @@ Regression after the fixes (random-input tensor compare): class max abs err n 6e
 `Im2col` remains for the stem. GEMM workgroups are 128 threads (2 waves) for SIMD occupancy.
 
 ### Python (`python/yolo26vk`)
-`Detector(model_dir, shader_dir=..., dll_path=...)` → `detect(image)` returns an `[N,6]` array in
+`Detector(onnx_path, shader_dir=..., dll_path=...)` → `detect(image)` returns an `[N,6]` array in
 original image coordinates. `infer_chw(chw)` takes an already-letterboxed `[3,640,640]` float array
 and skips the preprocessing. Letterbox + inverse box scaling in Python; tensor-in / detections-out via
 `ctypes` (GIL released during the call). `python/bench.py` benchmarks both entry points.
@@ -238,21 +260,17 @@ and skips the preprocessing. Letterbox + inverse box scaling in Python; tensor-i
 ```
 set VULKAN_SDK=D:\VulkanSDK\1.4.350.0
 make                       # builds bin/shader/*.spv, bin/test.exe, bin/yolo26.dll
-bin\test.exe engine_model\s --shader bin\shader --bench 200
+bin\test.exe model\small.onnx --shader bin\shader --bench 200
 tools\export\.venv\Scripts\python.exe python\bench.py --runs 100
 ```
 
-Regenerate an engine model from an ONNX export:
-
-```
-tools\export\.venv\Scripts\python.exe tools\export\parse_onnx.py model\small.onnx engine_model\s
-```
+The engine takes the ONNX file directly — no export/repack step is needed:
 
 Python:
 
 ```python
 from yolo26vk import Detector
-det = Detector("engine_model/s", shader_dir="bin/shader", dll_path="bin/yolo26.dll")
+det = Detector("model/small.onnx", shader_dir="bin/shader", dll_path="bin/yolo26.dll")
 boxes = det.detect(pil_or_numpy_image)   # -> np.ndarray [N, 6] x1,y1,x2,y2,score,cls
 ```
 

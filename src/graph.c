@@ -1,176 +1,125 @@
 #include "graph.h"
+#include "compile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static buffer* findBuffer(yolo_graph* g, const char* name) {
-    for (int i = 0; i < g->bufferCount; i++) {
-        if (strcmp(g->bufferNames[i], name) == 0) return &g->buffers[i];
-    }
-    for (int i = 0; i < g->weightCount; i++) {
-        if (strcmp(g->weightNames[i], name) == 0) return &g->weights[i];
-    }
-    return NULL;
-}
-
-static unsigned char* readFile(const char* path, long* sizeOut) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    unsigned char* buf = (unsigned char*)malloc((size_t)len);
-    if (fread(buf, 1, (size_t)len, f) != (size_t)len) {
-        free(buf);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    *sizeOut = len;
-    return buf;
-}
-
-int graphLoad(yolo_graph* g, const char* modelDir, const char* shaderDir) {
+int graphLoad(yolo_graph* g, const char* onnxPath, const char* shaderDir) {
     memset(g, 0, sizeof(*g));
-    char path[512];
-    snprintf(path, sizeof(path), "%s/graph.json", modelDir);
-    json_value* root = json_parse_file(path);
-    if (root == NULL) {
-        fprintf(stderr, "Error: cannot parse %s\n", path);
+
+    graph_plan plan;
+    if (compileOnnx(onnxPath, &plan) != 0) {
+        fprintf(stderr, "Error: %s\n", compileLastError());
         return -1;
     }
 
     g->sess = createSession();
     if (shaderDir != NULL) setShaderRootDir(shaderDir);
 
-    json_value* bufs = json_get(root, "buffers");
-    g->bufferCount = bufs->count;
-    g->buffers = (buffer*)calloc(g->bufferCount, sizeof(buffer));
-    g->bufferNames = (char**)calloc(g->bufferCount, sizeof(char*));
-
-    json_value* outp = json_get(root, "output");
-    const char* outName = json_get_str(outp, "buffer", "t0");
-
-    char wpath[512];
-    snprintf(wpath, sizeof(wpath), "%s/weights.bin", modelDir);
-    long wsize = 0;
-    unsigned char* wblob = readFile(wpath, &wsize);
-
-    json_value* weights = json_get(root, "weights");
-    g->weightCount = weights->count;
-    g->weights = (buffer*)calloc(g->weightCount, sizeof(buffer));
-    g->weightNames = (char**)calloc(g->weightCount, sizeof(char*));
-
-    for (int i = 0; i < g->bufferCount; i++) {
-        json_value* b = &bufs->items[i];
-        const char* name = json_get_str(b, "name", "t");
-        int size = json_get_int(b, "size", 0);
-        g->bufferNames[i] = strdup(name);
-        int64_t bytes = (int64_t)size * 4;
-        if (bytes <= 0) bytes = 4;
-        void* zero = calloc(1, (size_t)bytes);
-        int memType = (strcmp(name, outName) == 0) ? MEMORY_RAM_CACHED : MEMORY_VRAM;
-        g->buffers[i] = createBufferNamed(g->sess.dev.device, g->sess.dev.physicalDevice,
-                                          zero, bytes, memType, name);
-        free(zero);
+    int nAct = 0;
+    int nWgt = 0;
+    for (int i = 0; i < plan.resCount; i++) {
+        if (plan.res[i].isWeight) nWgt++;
+        else nAct++;
     }
+    g->bufferCount = nAct;
+    g->weightCount = nWgt;
+    g->buffers = (buffer*)calloc((size_t)nAct, sizeof(buffer));
+    g->bufferNames = (char**)calloc((size_t)nAct, sizeof(char*));
+    g->weights = (buffer*)calloc((size_t)nWgt, sizeof(buffer));
+    g->weightNames = (char**)calloc((size_t)nWgt, sizeof(char*));
 
-    for (int i = 0; i < g->weightCount; i++) {
-        json_value* w = &weights->items[i];
-        const char* name = json_get_str(w, "name", "w");
-        long off = (long)json_get_num(w, "offset", 0);
-        long nbytes = (long)json_get_num(w, "nbytes", 0);
-        g->weightNames[i] = strdup(name);
-        g->weights[i] = createBufferNamed(g->sess.dev.device, g->sess.dev.physicalDevice,
-                                          wblob + off, nbytes, MEMORY_VRAM, name);
+    int* resKind = (int*)malloc(sizeof(int) * (size_t)plan.resCount);
+    int* resIndex = (int*)malloc(sizeof(int) * (size_t)plan.resCount);
+    int ai = 0;
+    int wi = 0;
+    for (int i = 0; i < plan.resCount; i++) {
+        graph_res* r = &plan.res[i];
+        if (r->isWeight) {
+            g->weightNames[wi] = strdup(r->name);
+            g->weights[wi] = createBufferNamed(g->sess.dev.device, g->sess.dev.physicalDevice,
+                                               plan.wblob + r->off, r->nbytes, MEMORY_VRAM, r->name);
+            resKind[i] = 1;
+            resIndex[i] = wi;
+            wi++;
+        } else {
+            int64_t bytes = r->size * 4;
+            if (bytes <= 0) bytes = 4;
+            void* zero = calloc(1, (size_t)bytes);
+            int memType = (i == plan.outputRes) ? MEMORY_RAM_CACHED : MEMORY_VRAM;
+            g->bufferNames[ai] = strdup(r->name);
+            g->buffers[ai] = createBufferNamed(g->sess.dev.device, g->sess.dev.physicalDevice,
+                                               zero, bytes, memType, r->name);
+            free(zero);
+            resKind[i] = 0;
+            resIndex[i] = ai;
+            ai++;
+        }
     }
 
     createTransferAndCopy(g->sess.dev.device, g->sess.dev.queue, g->buffers, g->bufferCount);
     createTransferAndCopy(g->sess.dev.device, g->sess.dev.queue, g->weights, g->weightCount);
 
-    json_value* in = json_get(root, "input");
-    const char* inName = json_get_str(in, "buffer", "t0");
-    g->inputIndex = -1;
+    g->inputIndex = resIndex[plan.inputRes];
+    g->outputIndex = resIndex[plan.outputRes];
     for (int i = 0; i < g->bufferCount; i++) {
-        if (strcmp(g->bufferNames[i], inName) == 0) g->inputIndex = i;
-        if (g->inputIndex != i) releaseStaging(g->sess.dev.device, &g->buffers[i]);
+        if (i != g->inputIndex) releaseStaging(g->sess.dev.device, &g->buffers[i]);
     }
     for (int i = 0; i < g->weightCount; i++) {
         releaseStaging(g->sess.dev.device, &g->weights[i]);
     }
 
-    json_value* outp2 = json_get(root, "output");
-    g->outputIndex = -1;
-    for (int i = 0; i < g->bufferCount; i++) {
-        if (strcmp(g->bufferNames[i], outName) == 0) g->outputIndex = i;
-    }
-    g->outChannels = json_get_int(outp2, "channels", 0);
-    g->outAnchors = json_get_int(outp2, "anchors", 0);
-    g->outBoxes = json_get_int(outp2, "boxes", 4);
-    g->outClasses = json_get_int(outp2, "classes", 0);
-    g->outTopk = json_get_int(outp2, "topk", 300);
+    g->outChannels = plan.outChannels;
+    g->outAnchors = plan.outAnchors;
+    g->outBoxes = plan.outBoxes;
+    g->outClasses = plan.outClasses;
+    g->outTopk = plan.outTopk;
 
-    json_value* names = json_get(root, "names");
-    if (names != NULL && names->type == JSON_OBJECT) {
-        g->onnxCount = names->count;
-        g->onnxNames = (char**)calloc(g->onnxCount, sizeof(char*));
-        g->onnxBuf = (int*)calloc(g->onnxCount, sizeof(int));
-        g->onnxOff = (int*)calloc(g->onnxCount, sizeof(int));
-        for (int i = 0; i < g->onnxCount; i++) {
-            g->onnxNames[i] = strdup(names->keys[i]);
-            json_value* v = &names->values[i];
-            const char* bn = v->items[0].string;
-            g->onnxBuf[i] = -1;
-            for (int b = 0; b < g->bufferCount; b++) {
-                if (strcmp(g->bufferNames[b], bn) == 0) g->onnxBuf[i] = b;
-            }
-            g->onnxOff[i] = (int)v->items[1].number;
-        }
+    g->onnxCount = plan.tensorCount;
+    g->onnxNames = (char**)calloc((size_t)plan.tensorCount, sizeof(char*));
+    g->onnxBuf = (int*)calloc((size_t)plan.tensorCount, sizeof(int));
+    g->onnxOff = (int*)calloc((size_t)plan.tensorCount, sizeof(int));
+    for (int i = 0; i < plan.tensorCount; i++) {
+        g->onnxNames[i] = strdup(plan.tensorNames[i]);
+        g->onnxBuf[i] = resIndex[plan.tensorRes[i]];
+        g->onnxOff[i] = plan.tensorOff[i];
     }
 
-    json_value* ops = json_get(root, "ops");
-    g->opCount = ops->count;
-    g->ops = (operation*)calloc(g->opCount, sizeof(operation));
-    for (int i = 0; i < g->opCount; i++) {
-        json_value* o = &ops->items[i];
+    g->opCount = plan.opCount;
+    g->ops = (operation*)calloc((size_t)plan.opCount, sizeof(operation));
+    for (int i = 0; i < plan.opCount; i++) {
+        graph_op* o = &plan.ops[i];
         operation* op = &g->ops[i];
-        snprintf(op->shader, sizeof(op->shader), "%s", json_get_str(o, "shader", ""));
-        op->layer = json_get_int(o, "layer", -1);
-        json_value* bl = json_get(o, "buffers");
-        op->bufferCount = bl->count;
-        for (int b = 0; b < bl->count; b++) {
-            buffer* buf = findBuffer(g, bl->items[b].string);
-            if (buf == NULL) {
-                fprintf(stderr, "Error: op %d references unknown buffer '%s'\n", i, bl->items[b].string);
-                return -1;
-            }
-            op->buffers[b] = *buf;
+        snprintf(op->shader, sizeof(op->shader), "%s", o->shader);
+        op->layer = o->layer;
+        op->bufferCount = o->bufferCount;
+        for (int b = 0; b < o->bufferCount; b++) {
+            int ri = o->buffers[b];
+            op->buffers[b] = (resKind[ri] == 0) ? g->buffers[resIndex[ri]] : g->weights[resIndex[ri]];
         }
-        json_value* pc = json_get(o, "pc");
-        op->pushConstantCount = pc->count;
-        for (int p = 0; p < pc->count; p++) {
-            op->pushConstants[p] = (int)pc->items[p].number;
-        }
-        json_value* dp = json_get(o, "dispatch");
-        op->dispatchX = (int)dp->items[0].number;
-        op->dispatchY = (int)dp->items[1].number;
-        op->dispatchZ = (int)dp->items[2].number;
+        op->pushConstantCount = o->pushConstantCount;
+        for (int p = 0; p < o->pushConstantCount; p++) op->pushConstants[p] = o->pushConstants[p];
+        op->dispatchX = o->dispatchX;
+        op->dispatchY = o->dispatchY;
+        op->dispatchZ = o->dispatchZ;
     }
+
+    free(resKind);
+    free(resIndex);
+    freePlan(&plan);
 
     VkCommandPoolCreateInfo poolInfo = {0};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = 0;
     vkCreateCommandPool(g->sess.dev.device, &poolInfo, NULL, &g->uploadPool);
-    VkCommandBufferAllocateInfo ai = {0};
-    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    ai.commandPool = g->uploadPool;
-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ai.commandBufferCount = 1;
-    vkAllocateCommandBuffers(g->sess.dev.device, &ai, &g->uploadCmd);
+    VkCommandBufferAllocateInfo ai2 = {0};
+    ai2.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai2.commandPool = g->uploadPool;
+    ai2.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai2.commandBufferCount = 1;
+    vkAllocateCommandBuffers(g->sess.dev.device, &ai2, &g->uploadCmd);
 
-    json_free(root);
-    free(wblob);
     return 0;
 }
 
